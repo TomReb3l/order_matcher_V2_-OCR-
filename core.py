@@ -27,7 +27,7 @@ try:
 except ImportError:
     pytesseract = None
 
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 from build_config import OCR_ENABLED
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -317,6 +317,59 @@ def _run_tesseract_tsv(image: Image.Image, *, lang: str, base_config: str) -> pd
         return pd.read_csv(tsv_path, sep="\t")
 
 
+def _safe_numeric_conf(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(-1)
+
+
+def _preprocess_ocr_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
+    base = image.convert("L")
+    variants: list[tuple[str, Image.Image]] = []
+    clean = ImageOps.autocontrast(base)
+    variants.append(("gray_autocontrast", clean))
+    sharpened = clean.filter(ImageFilter.SHARPEN)
+    binary = sharpened.point(lambda px: 255 if px > 170 else 0, mode="1").convert("L")
+    variants.append(("binary_170", binary))
+    denoised = clean.filter(ImageFilter.MedianFilter(size=3))
+    binary_soft = ImageOps.autocontrast(denoised).point(lambda px: 255 if px > 150 else 0, mode="1").convert("L")
+    variants.append(("denoise_binary_150", binary_soft))
+    return variants
+
+
+def _ocr_result_score(df: pd.DataFrame) -> float:
+    if df is None or df.empty or "text" not in df.columns:
+        return float("-inf")
+    work = df.copy()
+    work["text"] = work["text"].astype(str).str.strip()
+    work = work[work["text"] != ""].copy()
+    if work.empty:
+        return float("-inf")
+    conf = _safe_numeric_conf(work["conf"]) if "conf" in work.columns else pd.Series([-1] * len(work))
+    tokens = work["text"].tolist()
+    six_digit = sum(1 for t in tokens if len(safe_registry(t)) == 6)
+    greekish = sum(1 for t in tokens if len(normalize_text(t)) >= 2 and re.search(r"[Α-ΩA-Z]", normalize_text(t)))
+    avg_conf = float(conf[conf >= 0].mean()) if (conf >= 0).any() else 0.0
+    low_conf_noise = int(((conf >= 0) & (conf < 20)).sum())
+    return six_digit * 8 + greekish * 0.6 + avg_conf * 0.15 - low_conf_noise * 0.4
+
+
+def _filter_ocr_tokens(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    work["text"] = work["text"].astype(str).str.strip()
+    work = work[work["text"] != ""].copy()
+    if work.empty:
+        return work
+    conf = _safe_numeric_conf(work["conf"]) if "conf" in work.columns else pd.Series([-1] * len(work), index=work.index)
+    norm = work["text"].map(normalize_text)
+    registry_like = work["text"].map(safe_registry).str.len().ge(4)
+    alpha_like = norm.str.contains(r"[Α-ΩA-Z]", regex=True)
+    keep = registry_like | alpha_like | conf.ge(28) | conf.eq(-1)
+    keep &= ~norm.str.fullmatch(r"[0-9]{1,2}")
+    keep |= registry_like
+    return work[keep].copy()
+
+
 def normalize_text(value: object) -> str:
     """Κανονικοποιεί κείμενο ώστε να συγκρίνεται ανθεκτικά (τόνοι, πεζά/κεφαλαία, symbols)."""
     if value is None:
@@ -379,14 +432,15 @@ def clean_patronymic(value: object) -> str:
     return text.strip(" .-–—")
 
 
+
 class PromotionPdfParser:
     """Διαβάζει διαταγές PDF είτε από native text layer είτε με OCR fallback."""
     SURNAME_X_MAX = 245
     NAME_X_MAX = 338
     PATRONYMIC_X_MAX = 468
     BASE_PAGE_WIDTH = 595
-    OCR_ZOOM = 1.6
-    OCR_CONFIG = "--oem 1 --psm 6"
+    OCR_ZOOM = 2.0
+    OCR_CONFIGS = ("--oem 1 --psm 6", "--oem 1 --psm 4")
 
     NOISE_TOKENS = {
         "ΥΠ.",
@@ -398,12 +452,11 @@ class PromotionPdfParser:
     }
 
     def __init__(self) -> None:
-        # Το mode γράφεται στα logs της εφαρμογής ώστε να ξέρουμε πώς διαβάστηκε το PDF.
         self.last_mode = ""
         self.tesseract_path = ""
+        self.last_ocr_variant = ""
 
     def parse(self, pdf_path: str | Path) -> pd.DataFrame:
-        """Προσπαθεί πρώτα native extraction και μόνο αν αποτύχει γυρνά σε OCR."""
         pdf_path = Path(pdf_path)
 
         try:
@@ -425,7 +478,6 @@ class PromotionPdfParser:
         return df
 
     def _parse_native(self, pdf_path: Path) -> pd.DataFrame:
-        # Γρήγορη και ακριβής διαδρομή για PDF που έχουν κανονικό text layer.
         rows: list[dict] = []
 
         with pdfplumber.open(str(pdf_path)) as pdf:
@@ -456,9 +508,8 @@ class PromotionPdfParser:
         return self._finalize_dataframe(rows)
 
     def _parse_ocr(self, pdf_path: Path) -> pd.DataFrame:
-        # Fallback για scanned / image-only PDF. Εδώ ενεργοποιείται το Tesseract.
         require_ocr_capability()
-    
+
         if fitz is None:
             raise RuntimeError(
                 "Η OCR έκδοση δεν έχει το package PyMuPDF. "
@@ -469,36 +520,42 @@ class PromotionPdfParser:
         ensure_tesseract_languages(["ell", "eng"])
 
         rows: list[dict] = []
+        selected_variants: list[str] = []
 
         with fitz.open(str(pdf_path)) as pdf:
             for page_index, page in enumerate(pdf, start=1):
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(self.OCR_ZOOM, self.OCR_ZOOM), alpha=False)
                 image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
                 page_width = image.width
-                surname_x_max = page_width * (self.SURNAME_X_MAX / self.BASE_PAGE_WIDTH)
-                name_x_max = page_width * (self.NAME_X_MAX / self.BASE_PAGE_WIDTH)
-                patronymic_x_max = page_width * (self.PATRONYMIC_X_MAX / self.BASE_PAGE_WIDTH)
 
-                # Native OCR μέσω bundled tesseract.exe -> TSV.
-                # Έτσι αποφεύγουμε το pytesseract runtime init που σπάει στο frozen build.
-                ocr_df = _run_tesseract_tsv(
-                    image,
-                    lang="ell+eng",
-                    base_config=self.OCR_CONFIG,
-                )
-                ocr_df = ocr_df.dropna(subset=["text"]).copy()
-                if ocr_df.empty:
+                best_df = pd.DataFrame()
+                best_score = float("-inf")
+                best_variant_name = ""
+
+                for variant_name, processed_image in _preprocess_ocr_variants(image):
+                    for config in self.OCR_CONFIGS:
+                        ocr_df = _run_tesseract_tsv(processed_image, lang="ell+eng", base_config=config)
+                        ocr_df = _filter_ocr_tokens(ocr_df)
+                        score = _ocr_result_score(ocr_df)
+                        if score > best_score:
+                            best_score = score
+                            best_df = ocr_df
+                            best_variant_name = f"{variant_name} | {config}"
+
+                if best_df.empty:
                     continue
 
-                ocr_df["text"] = ocr_df["text"].astype(str)
-                ocr_df = ocr_df[ocr_df["text"].str.strip() != ""].copy()
-                if ocr_df.empty:
-                    continue
+                selected_variants.append(f"σελ.{page_index}: {best_variant_name}")
 
                 grouped_lines = [
                     group.sort_values("left")
-                    for _, group in ocr_df.groupby(["block_num", "par_num", "line_num"], sort=True)
+                    for _, group in best_df.groupby(["block_num", "par_num", "line_num"], sort=True)
                 ]
+
+                surname_x_max, name_x_max, patronymic_x_max = self._estimate_column_boundaries(
+                    grouped_lines,
+                    page_width=page_width,
+                )
 
                 pending_record: Optional[dict] = None
                 pending_top: Optional[int] = None
@@ -523,7 +580,14 @@ class PromotionPdfParser:
 
                     if pending_record and pending_top is not None:
                         gap = current_top - pending_top
-                        if self._looks_like_continuation(line_words, gap):
+                        if self._looks_like_continuation(
+                            line_words,
+                            gap,
+                            pending_record=pending_record,
+                            name_x_max=name_x_max,
+                            patronymic_x_max=patronymic_x_max,
+                            x_key="left",
+                        ):
                             self._append_continuation(
                                 pending_record,
                                 line_words,
@@ -537,7 +601,90 @@ class PromotionPdfParser:
                             pending_record = None
                             pending_top = None
 
+        self.last_ocr_variant = " ; ".join(selected_variants[:6])
         return self._finalize_dataframe(rows)
+
+    def _estimate_column_boundaries(
+        self,
+        grouped_lines: list[pd.DataFrame],
+        *,
+        page_width: int,
+    ) -> tuple[float, float, float]:
+        surname_fallback = page_width * (self.SURNAME_X_MAX / self.BASE_PAGE_WIDTH)
+        name_fallback = page_width * (self.NAME_X_MAX / self.BASE_PAGE_WIDTH)
+        patronymic_fallback = page_width * (self.PATRONYMIC_X_MAX / self.BASE_PAGE_WIDTH)
+
+        surname_starts: list[float] = []
+        name_starts: list[float] = []
+        patronymic_starts: list[float] = []
+
+        for line_df in grouped_lines:
+            words = line_df.to_dict("records")
+            parsed = self._extract_registry_and_start_index(words)
+            if parsed is None:
+                continue
+            _, start_index = parsed
+            content = words[start_index:]
+            if len(content) < 2:
+                continue
+
+            columns: list[float] = []
+            current_bucket = [float(content[0]["left"])]
+            prev_left = float(content[0]["left"])
+            for word in content[1:]:
+                current_left = float(word["left"])
+                if current_left - prev_left > page_width * 0.045:
+                    columns.append(min(current_bucket))
+                    current_bucket = [current_left]
+                else:
+                    current_bucket.append(current_left)
+                prev_left = current_left
+            columns.append(min(current_bucket))
+
+            if len(columns) >= 1:
+                surname_starts.append(columns[0])
+            if len(columns) >= 2:
+                name_starts.append(columns[1])
+            if len(columns) >= 3:
+                patronymic_starts.append(columns[2])
+
+        surname_cut = (
+            (float(pd.Series(surname_starts).median()) + float(pd.Series(name_starts).median())) / 2
+            if surname_starts and name_starts
+            else surname_fallback
+        )
+        name_cut = (
+            (float(pd.Series(name_starts).median()) + float(pd.Series(patronymic_starts).median())) / 2
+            if name_starts and patronymic_starts
+            else name_fallback
+        )
+        patronymic_cut = (
+            min(patronymic_fallback, float(pd.Series(patronymic_starts).median()) + page_width * 0.09)
+            if patronymic_starts
+            else patronymic_fallback
+        )
+
+        surname_cut = max(page_width * 0.22, min(surname_cut, page_width * 0.50))
+        name_cut = max(surname_cut + page_width * 0.08, min(name_cut, page_width * 0.70))
+        patronymic_cut = max(name_cut + page_width * 0.08, min(patronymic_cut, page_width * 0.88))
+        return surname_cut, name_cut, patronymic_cut
+
+    def _extract_registry_and_start_index(self, line_words: list[dict]) -> Optional[tuple[str, int]]:
+        texts = [str(word.get("text", "")).strip() for word in line_words if str(word.get("text", "")).strip()]
+        if len(texts) < 2:
+            return None
+
+        for idx in range(min(3, len(texts))):
+            direct = safe_registry(texts[idx])
+            if len(direct) == 6:
+                return direct, idx + 1
+
+            if idx + 1 < len(texts):
+                merged = safe_registry(f"{texts[idx]}{texts[idx + 1]}")
+                if len(merged) == 6:
+                    return merged, idx + 2
+
+        return None
 
     def _build_record_from_words(
         self,
@@ -549,28 +696,21 @@ class PromotionPdfParser:
         patronymic_x_max: float,
         x_key: str,
     ) -> Optional[dict]:
-        # Η ίδια λογική δουλεύει τόσο για native words όσο και για OCR words.
         texts = [str(word.get("text", "")).strip() for word in line_words if str(word.get("text", "")).strip()]
         if len(texts) < 2:
             return None
 
         row_no: Optional[int] = None
-        registry_token_index = 1
-
         row_digits = re.sub(r"\D", "", texts[0])
         if row_digits and len(row_digits) <= 3:
             row_no = int(row_digits)
-        elif len(safe_registry(texts[0])) == 6:
-            registry_token_index = 0
-        else:
+
+        parsed = self._extract_registry_and_start_index(line_words)
+        if parsed is None:
             return None
 
-        registry = safe_registry(texts[registry_token_index])
-        if len(registry) != 6:
-            return None
-
-        start_index = registry_token_index + 1
-        if len(texts) <= start_index:
+        registry, start_index = parsed
+        if start_index >= len(line_words):
             return None
 
         record = {
@@ -587,6 +727,12 @@ class PromotionPdfParser:
             x = float(word[x_key])
             token = str(word.get("text", "")).strip()
             if not token:
+                continue
+
+            conf_raw = str(word.get("conf", "")).strip()
+            conf = float(conf_raw) if conf_raw not in {"", "nan", "None"} else -1
+            normalized = normalize_text(token)
+            if conf >= 0 and conf < 15 and not normalized and not safe_registry(token):
                 continue
 
             if x < surname_x_max:
@@ -621,22 +767,34 @@ class PromotionPdfParser:
             "extra": extra,
         }
 
-    def _looks_like_continuation(self, line_words: list[dict], gap: int) -> bool:
-        if not line_words:
-            return False
-        if gap > 70:
+    def _looks_like_continuation(
+        self,
+        line_words: list[dict],
+        gap: int,
+        *,
+        pending_record: Optional[dict] = None,
+        name_x_max: Optional[float] = None,
+        patronymic_x_max: Optional[float] = None,
+        x_key: str = "left",
+    ) -> bool:
+        if not line_words or gap > 65:
             return False
 
         texts = [str(word.get("text", "")).strip() for word in line_words if str(word.get("text", "")).strip()]
-        if not texts or len(texts) > 4:
+        if not texts or len(texts) > 5:
             return False
 
-        first_token = texts[0]
-        first_digits = re.sub(r"\D", "", first_token)
-        if first_digits and len(first_digits) <= 3:
+        if self._extract_registry_and_start_index(line_words) is not None:
             return False
-        if len(safe_registry(first_token)) == 6:
+
+        normalized = [normalize_text(t) for t in texts]
+        if not any(re.search(r"[Α-ΩA-Z]", token) for token in normalized):
             return False
+
+        if pending_record and not pending_record.get("patronymic") and patronymic_x_max is not None:
+            lefts = [float(word.get(x_key, 0)) for word in line_words]
+            if lefts and min(lefts) >= (name_x_max or 0) * 0.95:
+                return True
 
         return True
 
@@ -667,7 +825,6 @@ class PromotionPdfParser:
                 record["extra"] = (f"{record.get('extra', '')} {token}").strip()
 
     def _finalize_dataframe(self, rows: list[dict]) -> pd.DataFrame:
-        # Αφαιρούμε duplicates και φτιάχνουμε normalized πεδία για αξιόπιστη σύγκριση.
         df = pd.DataFrame(rows)
         if df.empty:
             raise ValueError("Δεν βρέθηκαν εγγραφές στο PDF.")

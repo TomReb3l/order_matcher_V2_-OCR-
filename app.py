@@ -368,6 +368,8 @@ class App(ctk.CTk):
 
             if getattr(self.pdf_parser, "tesseract_path", "") and "OCR" in getattr(self.pdf_parser, "last_mode", ""):
                 self.log(f"Tesseract: {self.pdf_parser.tesseract_path}")
+            if getattr(self.pdf_parser, "last_ocr_variant", ""):
+                self.log(f"OCR προφίλ: {self.pdf_parser.last_ocr_variant}")
 
             self.log(f"Διαβάστηκαν {len(promotions_df)} εγγραφές από το PDF.")
 
