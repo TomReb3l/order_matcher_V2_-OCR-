@@ -1,0 +1,2 @@
+APP_VARIANT = "LITE"
+OCR_ENABLED = False

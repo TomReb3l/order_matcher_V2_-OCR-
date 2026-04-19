@@ -1,0 +1,25 @@
+Τελικός έλεγχος archive
+======================
+
+Το αρχικό archive ΔΕΝ ήταν έτοιμο για καθαρό repo/release.
+
+Βρέθηκαν:
+- build_config.py σε OCR mode αντί για default Lite
+- κενό requirements-ocr.txt
+- κενό .gitignore
+- παλιά build scripts
+- άχρηστα/παλιά αρχεία: build_config_lite.py, build_config_ocr.py, OrderMatcher-OCR.spec
+- ασυνέπεια repo/build policy
+
+Το παρόν clean repo περιέχει:
+- διορθωμένο core.py με το τελικό OCR fix
+- νέα build_lite.bat / build_ocr.bat χωρίς εξάρτηση από extra build_config_* files
+- έτοιμο make_portable.bat
+- έτοιμα installer_lite.iss / installer_ocr.iss για Inno Setup
+- σωστό README.md
+- σωστό .gitignore
+- συμπληρωμένο requirements-ocr.txt
+
+Σημείωση:
+Δεν έγινε πραγματικό Windows build ή compile installer μέσα στο παρόν περιβάλλον.
+Έγινε έλεγχος δομής και syntax των Python αρχείων.
