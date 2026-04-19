@@ -3,6 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 
+set "APP_NAME=OrderMatcher-Lite"
 set "PYTHON=.venv_lite\Scripts\python.exe"
 
 if not exist "%PYTHON%" (
@@ -19,15 +20,15 @@ if not exist "%PYTHON%" (
 )
 
 set "EXTRA_ARGS="
-if exist "app_icon.ico" set "EXTRA_ARGS=!EXTRA_ARGS! --add-data app_icon.ico;."
-if exist "assets_icon.png" set "EXTRA_ARGS=!EXTRA_ARGS! --add-data assets_icon.png;."
+if exist "app_icon.ico" set "EXTRA_ARGS=!EXTRA_ARGS! --add-data ""app_icon.ico;."""
+if exist "assets_icon.png" set "EXTRA_ARGS=!EXTRA_ARGS! --add-data ""assets_icon.png;."""
 
-rmdir /s /q build 2>nul
-rmdir /s /q dist 2>nul
-del /q OrderMatcher-Lite.spec 2>nul
+if exist "build\%APP_NAME%" rmdir /s /q "build\%APP_NAME%"
+if exist "dist\%APP_NAME%" rmdir /s /q "dist\%APP_NAME%"
+del /q "%APP_NAME%.spec" 2>nul
 
 echo [INFO] Γίνεται build της Lite έκδοσης...
-"%PYTHON%" -m PyInstaller --noconfirm --clean --windowed --name OrderMatcher-Lite !EXTRA_ARGS! ^
+"%PYTHON%" -m PyInstaller --noconfirm --clean --windowed --name "%APP_NAME%" !EXTRA_ARGS! ^
   --hidden-import customtkinter ^
   --hidden-import tkinter ^
   --hidden-import PIL ^
@@ -55,6 +56,7 @@ if not "%BUILD_EXIT%"=="0" (
 
 echo.
 echo [DONE] Ολοκληρώθηκε το Lite build.
-echo Άνοιξε τον φάκελο dist\OrderMatcher-Lite\
+echo Άνοιξε τον φάκελο dist\%APP_NAME%\
+echo [INFO] Το build διατηρεί τυχόν υπάρχον dist\OrderMatcher-OCR\ ανέπαφο.
 endlocal
 pause

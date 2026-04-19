@@ -75,6 +75,27 @@ order_matcher/
 
 ---
 
+## Τι δεν ανεβαίνει στο repo
+
+Τα παρακάτω είναι build / local artifacts και καλό είναι να μένουν εκτός Git:
+
+```text
+.venv/
+.venv_lite/
+.venv_ocr/
+build/
+dist/
+portable/
+installer_output/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+```
+
+---
+
 ## Απαιτήσεις
 
 - Windows
@@ -95,6 +116,8 @@ build_lite.bat
 
 `dist/OrderMatcher-Lite/`
 
+Το script καθαρίζει μόνο το `build\OrderMatcher-Lite` και το `dist\OrderMatcher-Lite`, χωρίς να σβήνει τυχόν υπάρχον OCR build.
+
 ---
 
 ## Build - OCR
@@ -108,6 +131,19 @@ build_ocr.bat
 Παράγει:
 
 `dist/OrderMatcher-OCR/`
+
+Το script καθαρίζει μόνο το `build\OrderMatcher-OCR` και το `dist\OrderMatcher-OCR`, χωρίς να σβήνει τυχόν υπάρχον Lite build.
+
+---
+
+## Προτεινόμενη σειρά build
+
+Για να έχεις και τις δύο εκδόσεις διαθέσιμες ταυτόχρονα:
+
+1. Τρέχεις `build_lite.bat`
+2. Τρέχεις `build_ocr.bat`
+
+ή και ανάποδα. Τα δύο scripts πλέον δεν αλληλοσβήνονται στο `dist/`.
 
 ---
 
@@ -124,7 +160,9 @@ make_portable.bat
 - `OrderMatcher-Lite-Portable.zip`
 - `OrderMatcher-OCR-Portable.zip`
 
-ανάλογα με το ποια builds υπάρχουν μέσα στο `dist/`.
+για όσα builds υπάρχουν μέσα στο `dist/`.
+
+Τα ZIP περιέχουν τον αντίστοιχο φάκελο εφαρμογής ως root folder, ώστε ο χρήστης να κάνει extract πιο καθαρά.
 
 ---
 
@@ -146,14 +184,14 @@ make_portable.bat
 
 ## GitHub Releases
 
-Πρότεινεται να ανεβάζεις 4 artifacts όταν τα θες όλα έτοιμα:
+Αν θέλεις πλήρες release, τα πιο χρήσιμα artifacts είναι:
 
-- `OrderMatcher-Lite`  
-- `OrderMatcher-OCR`  
-- `OrderMatcher-Lite-Portable.zip`  
+- `OrderMatcher-Lite`
+- `OrderMatcher-OCR`
+- `OrderMatcher-Lite-Portable.zip`
 - `OrderMatcher-OCR-Portable.zip`
 
-Και προαιρετικά τους installers:
+και προαιρετικά:
 
 - `OrderMatcher-Lite-Setup.exe`
 - `OrderMatcher-OCR-Setup.exe`
